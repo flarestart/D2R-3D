@@ -63,6 +63,15 @@ int wmain() {
     if (!FileExists(dll)) { Log(L"not found: %s\n", dll.c_str()); return 1; }
 
     std::wstring cmd = L"\"" + exe + L"\"";
+    // Skip argv[0], preserving the original argument text and quoting verbatim.
+    const wchar_t* args = GetCommandLineW();
+    bool quoted = false;
+    while (*args) {
+        if (*args == L'"') quoted = !quoted;
+        else if (!quoted && (*args == L' ' || *args == L'\t')) break;
+        ++args;
+    }
+    cmd += args;
     STARTUPINFOW si{sizeof si};
     PROCESS_INFORMATION pi{};
     if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_SUSPENDED, nullptr, dir.c_str(), &si, &pi))

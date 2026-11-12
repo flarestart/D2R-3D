@@ -8,7 +8,11 @@ load("@rules_pkg//pkg:zip.bzl", "pkg_zip")
 
 cc_binary(
     name = "d2r-3d.dll",
-    srcs = ["d2r3d.cpp"],
+    srcs = [
+        "d2r3d.cpp",
+        "automap_hooks.inl",
+        "automap_transform.h",
+    ],
     copts = [
         "/utf-8",
         "/W3",

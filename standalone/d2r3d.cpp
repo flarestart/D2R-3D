@@ -43,16 +43,16 @@
 #include <vector>
 
 #include "MinHook.h"
+#include "automap_transform.h"
 
 #pragma intrinsic(_ReturnAddress)
 
 namespace {
 
 // Settings
-constexpr float kFov = 60.0f;           // perspective vertical FOV (deg)
 constexpr float kDist = 45.0f;          // default camera-to-pivot distance (world units); the wheel changes it
-constexpr float kPitch = 22.0f;         // default pitch (deg)
-constexpr float kHeight = 6.0f;         // pivot lift above the ground look-at point (world up)
+constexpr float kPitch = 0.0f;          // preserve the original pitch on activation
+constexpr float kHeight = 0.0f;         // preserve the original look-at point
 constexpr float kMvRadius = 3000.0f;    // model visibility radius (vanilla 150)
 constexpr float kShadowSlope = 0.5f;    // min downward slope of shadow-fit rays
 constexpr int   kBuildRings = 12;       // extra rings of rooms built around the player
@@ -183,6 +183,7 @@ bool g_shadowOk = false;
 
 struct Cam { uintptr_t ptr; float proj0[16]; float extW, extH, nearZ; int type; bool haveBase, written; uint32_t lastGen; float lookSign; };
 SRWLOCK g_camLock = SRWLOCK_INIT;
+automap::Transform g_mapTransform;
 Cam g_cams[8];
 int g_camCount = 0;
 
@@ -191,17 +192,14 @@ Cam* FindCam(uintptr_t s) { for (int i = 0; i < g_camCount; ++i) if (g_cams[i].p
 // Camera-to-pivot distance.
 float Radius(const Cam&) { return g_dist.load(); }
 
-// Infinite reverse-Z perspective, same form as the game's own perspective branch
-// (proj[10] = 0, proj[11] = -1, proj[14] = near), keeping the ortho view's screen offset.
+// Preserve the game's projection. Orthographic zoom changes only its scale;
+// perspective zoom is handled by moving the view, without changing FOV.
 void BuildProj(const Cam& c, float* M) {
-    const float aspect = c.extH > 0 && c.extW / c.extH > 0.1f && c.extW / c.extH < 10.0f ? c.extW / c.extH : 16.0f / 9.0f;
-    const float f = 1.0f / tanf(kFov * 3.14159265f / 360.0f);
-    const float radius = Radius(c);
-    const float nearZ = c.nearZ > 0.0f && c.nearZ < radius * 0.5f ? c.nearZ : radius * 0.05f;
-    memset(M, 0, 64);
-    M[0] = f / aspect; M[5] = f;
-    M[8] = -c.proj0[12]; M[9] = -c.proj0[13];
-    M[11] = -1.0f; M[14] = nearZ;
+    memcpy(M, c.proj0, 64);
+    if (c.type == 1) {
+        const float scale = kDist / g_dist.load();
+        M[0] *= scale; M[5] *= scale;
+    }
 }
 
 // Camera hooks
@@ -244,6 +242,7 @@ uintptr_t HookGetProj(uintptr_t s) {
             memcpy((void*)(s + S_PROJ), M, 64);
             c->written = true;
         } else if (c->written) {
+            memcpy((void*)(s + S_PROJ), c->proj0, 64);
             F<uint8_t>(s, S_PDIRTY) = 1; c->written = false;
         }
     }
@@ -256,7 +255,10 @@ void HookViewRebuild(uintptr_t s) {
     if (!s || !g_enabled.load()) return;
     AcquireSRWLockExclusive(&g_camLock);
     Cam* c = FindCam(s);
-    if (c && c->haveBase && c->ptr == g_master.load()) {
+    if (s == g_master.load()) g_mapTransform = {};
+    if (c && c->haveBase && c->ptr == g_master.load() &&
+        (g_pitch.load() != 0.0f || g_yaw.load() != 0.0f ||
+         (c->type != 1 && g_dist.load() != kDist))) {
         float view[16]; memcpy(view, (void*)(s + S_VIEW), 64);
         float P[4] = {0, 0, -Radius(*c), 1};
         if (F<uint8_t>(s, S_LOOKAT_OK)) {   // pivot = look-at point lifted to body height (world y-up)
@@ -270,11 +272,12 @@ void HookViewRebuild(uintptr_t s) {
         const float un = sqrtf(view[4]*view[4] + view[5]*view[5] + view[6]*view[6]);   // world up in view space
         if (g_yaw.load() != 0.0f && un > 1e-6f) { AxisRot4(Ry, view[4]/un, view[5]/un, view[6]/un, g_yaw.load() * d2r); Mul4(Ry, R, RR); memcpy(R, RR, 64); }
         float A[16]; memcpy(A, R, 64);
-        A[12] = -(P[0]*R[0] + P[1]*R[4] + P[2]*R[8]);
-        A[13] = -(P[0]*R[1] + P[1]*R[5] + P[2]*R[9]);
-        A[14] = sgn * Radius(*c) - (P[0]*R[2] + P[1]*R[6] + P[2]*R[10]);
+        A[12] = P[0] - (P[0]*R[0] + P[1]*R[4] + P[2]*R[8]);
+        A[13] = P[1] - (P[0]*R[1] + P[1]*R[5] + P[2]*R[9]);
+        A[14] = P[2] * (c->type == 1 ? 1.0f : g_dist.load() / kDist) - (P[0]*R[2] + P[1]*R[6] + P[2]*R[10]);
         float folded[16], inv[16];
         Mul4(view, A, folded);
+        automap::FromViews(view, folded, g_mapTransform);
         memcpy((void*)(s + S_VIEW), folded, 64);
         if (Invert4(folded, inv)) memcpy((void*)(s + S_INVVIEW), inv, 64);
         c->lookSign = sgn;
@@ -295,7 +298,7 @@ bool UnprojectRay(uintptr_t s, const float* mouse, float lookSign, float* origin
     if (fabsf(a[3]) < 1e-12f || fabsf(b[3]) < 1e-12f) return false;
     float d[4] = {b[0]/b[3] - a[0]/a[3], b[1]/b[3] - a[1]/a[3], b[2]/b[3] - a[2]/a[3], 0};
     if (d[2] * lookSign < 0) { d[0] = -d[0]; d[1] = -d[1]; d[2] = -d[2]; }
-    const float eye[4] = {0, 0, 0, 1};
+    const float eye[4] = {a[0]/a[3], a[1]/a[3], a[2]/a[3], 1};
     float ow[4], dw[4]; Vec4Mat(eye, invV, ow); Vec4Mat(d, invV, dw);
     const float n = sqrtf(dw[0]*dw[0] + dw[1]*dw[1] + dw[2]*dw[2]);
     if (!(n > 1e-9f) || fabsf(ow[3]) < 1e-12f) return false;
@@ -509,6 +512,8 @@ bool Hook(const char* name, uint64_t rva, void* detour, void** orig) {
     return true;
 }
 
+#include "automap_hooks.inl"
+
 bool InstallHooks() {
     Log("installing (image base %p)", (void*)g_base);
     if (!Verify("CopyCall") || !Hook("CamCopy", RVA_CAMCOPY, (void*)&HookCamCopy, (void**)&OrigCamCopy) ||
@@ -517,6 +522,7 @@ bool InstallHooks() {
         Log("camera functions not found - wrong game version, or not in a game yet");
         return false;
     }
+    InstallAutomapHooks();
     g_shadowOk = Verify("ShadowFit");
     Hook("RayBuild", RVA_RAYBUILD, (void*)&HookRayBuild, (void**)&OrigRayBuild);
     Hook("ActTest", RVA_ACTTEST, (void*)&HookActTest, (void**)&OrigActTest);
@@ -582,6 +588,7 @@ DWORD WINAPI Worker(void*) {
         if (f12 && !f12Was) {
             if (!g_hooked.load()) g_hooked.store(InstallHooks());
             if (g_hooked.load()) {
+                if (!g_enabled.load()) { g_dist.store(kDist); g_pitch.store(kPitch); g_yaw.store(0.0f); }
                 g_enabled.store(!g_enabled.load());
                 g_gen.fetch_add(1);
                 Log("d2r-3d %s", g_enabled.load() ? "ON" : "OFF");
@@ -591,7 +598,10 @@ DWORD WINAPI Worker(void*) {
         if (GetTickCount64() - lastApply > 250) {
             lastApply = GetTickCount64();
             GrowPools(); // As early as possible
-            if (g_hooked.load()) { ApplyMvRadius(); ApplyActDepth(); }
+            if (g_hooked.load()) {
+                if (g_enabled.load() && !g_mapReady.load()) InstallAutomapHooks();
+                ApplyMvRadius(); ApplyActDepth();
+            }
         }
         FlushLog();
     }
